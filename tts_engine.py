@@ -3,6 +3,8 @@ import os
 import re
 import uuid
 import wave
+import time
+from pathlib import Path
 from typing import Optional, List, Dict
 
 import httpx
@@ -17,10 +19,44 @@ SAMPLE_RATE = 32000
 class TTSEngine:
     """处理所有与TTS合成相关的核心逻辑，包括文本分块、并发合成和音频合并"""
 
-    def __init__(self, config: AstrBotConfig, http_client: httpx.AsyncClient):
+    def __init__(self, config: AstrBotConfig, http_client: httpx.AsyncClient, plugin_data_dir: Path):
         self.config = config
         self.http_client = http_client
+        self.plugin_data_dir = plugin_data_dir
         self.tts_server_index = 0
+        
+        # 设置临时音频目录
+        self.temp_audio_dir = self.plugin_data_dir / "temp_audio"
+        self.temp_audio_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 启动清理任务
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+    async def _cleanup_loop(self):
+        """定期清理过期的临时音频文件"""
+        while True:
+            try:
+                await asyncio.sleep(3600)  # 每小时检查一次
+                current_time = time.time()
+                expiration_time = 1800  # 30分钟过期
+
+                if not self.temp_audio_dir.exists():
+                    continue
+
+                count = 0
+                for file_path in self.temp_audio_dir.glob("*.wav"):
+                    try:
+                        if current_time - file_path.stat().st_mtime > expiration_time:
+                            file_path.unlink()
+                            count += 1
+                    except Exception as e:
+                        logger.warning(f"清理文件 {file_path} 失败: {e}")
+                
+                if count > 0:
+                    logger.info(f"已清理 {count} 个过期的临时音频文件。")
+                    
+            except Exception as e:
+                logger.error(f"清理任务发生错误: {e}")
 
     def _split_text_into_chunks(self, text: str, sentences_per_chunk: int) -> list[str]:
         """根据标点将文本切分为句子，再按指定数量合并成块"""
@@ -55,32 +91,32 @@ class TTSEngine:
         if not input_paths:
             return None
         
-        output_dir = os.path.join("data", "temp_audio")
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"{uuid.uuid4()}_merged.wav")
+        output_path = self.temp_audio_dir / f"{uuid.uuid4()}_merged.wav"
 
         try:
             with wave.open(input_paths[0], 'rb') as wf_in:
                 params = wf_in.getparams()
 
-            with wave.open(output_path, 'wb') as wf_out:
+            with wave.open(str(output_path), 'wb') as wf_out:
                 wf_out.setparams(params)
                 for file_path in input_paths:
                     with wave.open(file_path, 'rb') as wf_in:
                         wf_out.writeframes(wf_in.readframes(wf_in.getnframes()))
             
             logger.info(f"成功将 {len(input_paths)} 个音频文件合并到: {output_path}")
+            return str(output_path)
             
-            for file_path in input_paths:
-                try:
-                    os.remove(file_path)
-                except OSError as e:
-                    logger.warning(f"删除临时文件 {file_path} 失败: {e}")
-                    
-            return output_path
         except Exception as e:
             logger.error(f"合并WAV文件时出错: {e}")
             return None
+        finally:
+            # 无论合并成功与否，都尝试清理输入的临时分块文件
+            for file_path in input_paths:
+                try:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                except OSError as e:
+                    logger.warning(f"删除临时文件 {file_path} 失败: {e}")
 
     async def _attempt_synthesis_on_server(
         self, server_url: str, character_name: str, ref_audio_path: str,
@@ -98,16 +134,14 @@ class TTSEngine:
             tts_payload = {"character_name": character_name, "text": text, "split_sentence": True}
             async with self.http_client.stream("POST", f"{server_url}/tts", json=tts_payload, timeout=300) as response_tts:
                 response_tts.raise_for_status()
-                output_dir = os.path.join("data", "temp_audio")
-                os.makedirs(output_dir, exist_ok=True)
-                output_path = os.path.join(output_dir, f"{uuid.uuid4()}.wav")
-                with wave.open(output_path, "wb") as wf:
+                output_path = self.temp_audio_dir / f"{uuid.uuid4()}.wav"
+                with wave.open(str(output_path), "wb") as wf:
                     wf.setnchannels(CHANNELS)
                     wf.setsampwidth(BYTES_PER_SAMPLE)
                     wf.setframerate(SAMPLE_RATE)
                     async for chunk in response_tts.aiter_bytes():
                         wf.writeframes(chunk)
-                return output_path
+                return str(output_path)
         except Exception as e:
             logger.warning(f"[{session_id_for_log}] TTS服务器 {server_url} 交互失败: {e}")
             return None
@@ -183,8 +217,16 @@ class TTSEngine:
                 await asyncio.gather(*workers, return_exceptions=True)
 
                 successful_paths = [path for path in results_list if path]
-                if not successful_paths:
-                    logger.error(f"[{session_id_for_log}] 所有语音块都合成失败。")
+                
+                # 如果有部分失败，或者全部失败，都需要清理已经生成的临时文件
+                if len(successful_paths) != len(text_chunks):
+                    logger.error(f"[{session_id_for_log}] 部分或全部语音块合成失败，正在清理临时文件。")
+                    for path in successful_paths:
+                         try:
+                            if os.path.exists(path):
+                                os.remove(path)
+                         except Exception as e:
+                             logger.warning(f"清理残留文件 {path} 失败: {e}")
                     return None
                 
                 return successful_paths[0] if len(successful_paths) == 1 else await self._merge_wav_files(successful_paths)

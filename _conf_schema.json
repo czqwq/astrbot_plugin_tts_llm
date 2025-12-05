@@ -70,7 +70,7 @@
   },
   "space_keepalive_url": {
     "type": "string",
-    "description": "保活请求的目标地址（默认使用第一个TTS服务器地址）"
+    "description": "额外的保活请求目标地址（插件会自动对所有配置的TTS服务器进行保活，此处可配置额外的地址）"
   },
   "space_keepalive_interval_minutes": {
     "type": "int",
