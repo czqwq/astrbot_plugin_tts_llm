@@ -8,7 +8,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger, AstrBotConfig
 import astrbot.api.message_components as Comp
-from astrbot.api.provider import LLMResponse
+from astrbot.api.provider import LLMResponse, ProviderRequest
 
 # 从新模块导入功能
 from .emotion_manager import EmotionManager
@@ -20,7 +20,7 @@ from .external_apis import translate_text
     "astrbot_plugin_tts_llm",
     "clown145",
     "一个通过LLM、翻译和TTS实现语音合成的插件",
-    "1.2.2",
+    "1.3.0",
     "https://github.com/clown145/astrbot_plugin_tts_llm",
 )
 class LlmTtsPlugin(Star):
@@ -29,6 +29,7 @@ class LlmTtsPlugin(Star):
         self.config = config
         self.active_sessions: Set[str] = set()
         self.w_active_sessions: Set[str] = set()
+        self.active_groups: Set[str] = set() # 新增：群组级TTS开关
         self.session_emotions: Dict[str, Dict[str, str]] = {}
         self.session_w_settings: Dict[str, Dict[str, str]] = {}
         self._keepalive_stop_event = asyncio.Event()
@@ -184,6 +185,40 @@ class LlmTtsPlugin(Star):
         logger.info(f"会话 [{session_id}] 的所有 LLM TTS 功能已关闭。")
         yield event.plain_result("⏹️ 本对话的所有LLM语音合成功能已关闭。")
 
+    @filter.command("ttg", alias={"开启群语音"})
+    async def start_group_tts(self, event: AstrMessageEvent):
+        """开启当前群组的语音合成 (对所有人生效)"""
+        group_id = event.message_obj.group_id
+        if not group_id:
+             yield event.plain_result("❌ 此指令仅限群聊使用。")
+             return
+        
+        self.active_groups.add(group_id)
+        default_char = self.config.get("default_character")
+        default_emotion = self.config.get("default_emotion_name")
+        
+        settings = self.config.get("llm_injection_settings", {})
+        enable_emotion = settings.get("enable_llm_emotion", False)
+        
+        logger.info(f"群组 [{group_id}] 的 LLM TTS 功能已开启。")
+        
+        if enable_emotion:
+            yield event.plain_result(f"▶️ 本群组的LLM语音合成已开启 (全员生效)。\n当前已启用LLM情感注入，情感将由AI自动决定。\n(默认保底情感: {default_char} - {default_emotion})")
+        else:
+            yield event.plain_result(f"▶️ 本群组的LLM语音合成已开启 (全员生效)。\n当前为固定情感模式: {default_char} - {default_emotion}")
+
+    @filter.command("ttg-q", alias={"关闭群语音"})
+    async def stop_group_tts(self, event: AstrMessageEvent):
+        """关闭当前群组的语音合成"""
+        group_id = event.message_obj.group_id
+        if not group_id:
+             yield event.plain_result("❌ 此指令仅限群聊使用。")
+             return
+
+        self.active_groups.discard(group_id)
+        logger.info(f"群组 [{group_id}] 的 LLM TTS 功能已关闭。")
+        yield event.plain_result("⏹️ 本群组的LLM语音合成已关闭。")
+
     @filter.command("tts-w", alias={"开启自动情感识别"})
     async def start_tts_w(self, event: AstrMessageEvent):
         session_id = event.unified_msg_origin
@@ -241,71 +276,204 @@ class LlmTtsPlugin(Star):
             session_id_for_log=session_id,
         )
 
+    @filter.on_llm_request()
+    async def inject_llm_prompt(self, event: AstrMessageEvent, req: ProviderRequest):
+        """在LLM请求前注入提示词"""
+        session_id = event.unified_msg_origin
+        group_id = event.message_obj.group_id
+        
+        # 只有在开启了TTS模式（自动或固定，或群组模式）时才注入
+        is_active = (session_id in self.active_sessions or 
+                     session_id in self.w_active_sessions or 
+                     (group_id and group_id in self.active_groups))
+        
+        if not is_active:
+            return
+
+        settings = self.config.get("llm_injection_settings", {})
+        enable_emotion = settings.get("enable_llm_emotion", False)
+        enable_translation = settings.get("enable_llm_translation", False)
+
+        if not enable_emotion and not enable_translation:
+            return
+
+        prompts_to_inject = []
+
+        if enable_emotion:
+            # 确定当前角色以获取可用情感列表
+            char_name = None
+            if session_id in self.w_active_sessions:
+                char_name = self.session_w_settings.get(session_id, {}).get("character") or self.config.get("default_character")
+            elif session_id in self.active_sessions or (group_id and group_id in self.active_groups):
+                # 固定模式或群组模式下
+                session_setting = self.session_emotions.get(session_id)
+                char_name = session_setting["character"] if session_setting else self.config.get("default_character")
+
+            if char_name and self.emotion_manager.character_exists(char_name):
+                emotions = list(self.emotion_manager.emotions_data[char_name].keys())
+                emotions_str = ", ".join(emotions)
+                
+                prompt_template = settings.get("llm_emotion_prompt", "")
+                try:
+                    emotion_prompt = prompt_template.format(emotions=emotions_str)
+                except KeyError:
+                    emotion_prompt = prompt_template
+                prompts_to_inject.append(emotion_prompt)
+
+        if enable_translation:
+            trans_prompt = settings.get("llm_translation_prompt", "")
+            if trans_prompt:
+                prompts_to_inject.append(trans_prompt)
+
+        if prompts_to_inject:
+            final_prompt = "\n\n".join(prompts_to_inject)
+            req.system_prompt += f"\n\n{final_prompt}"
+            logger.info(f"[{session_id}] 已注入LLM提示词 (Emotion: {enable_emotion}, Trans: {enable_translation})")
+
+
     @filter.on_llm_response()
     async def intercept_llm_response_for_tts(self, event: AstrMessageEvent, resp: LLMResponse):
         session_id = event.unified_msg_origin
+        group_id = event.message_obj.group_id
         original_text = resp.completion_text.strip()
         if not original_text:
             return
 
-        audio_path: Optional[str] = None
+        # 检查是否开启了TTS (个人会话 或 群组)
+        is_active = (session_id in self.active_sessions or 
+                     session_id in self.w_active_sessions or 
+                     (group_id and group_id in self.active_groups))
+
+        if not is_active:
+            return
+
+        settings = self.config.get("llm_injection_settings", {})
+        enable_llm_emotion = settings.get("enable_llm_emotion", False)
+        enable_llm_translation = settings.get("enable_llm_translation", False)
+
+        # 1. 提取情感标签 [emotion=xxx]
+        emotion_match = re.search(r'\[emotion=(.*?)\]', original_text)
+        injected_emotion = None
+        if emotion_match:
+            injected_emotion = emotion_match.group(1).strip()
+            # 从原文中移除标签，保持回复干净
+            original_text = original_text.replace(emotion_match.group(0), "")
+
+        # 2. 提取翻译内容 $xxx$
+        translation_match = re.search(r'\$(.*?)\$', original_text, re.DOTALL)
+        injected_translation = None
+        if translation_match:
+            injected_translation = translation_match.group(1).strip()
+            # 从原文中移除翻译，保持回复干净
+            original_text = original_text.replace(translation_match.group(0), "")
+
+        # 更新 LLM 回复文本为净化后的文本 (去除标签和翻译部分)
+        resp.completion_text = original_text.strip()
+        # 同时更新 result_chain 中的 Plain 消息，否则用户还是会看到标签
+        # 注意：这里假设 result_chain 第一个是 Plain。如果不是，可能需要遍历。
+        # 简单起见，我们重建 chain
+        resp.result_chain.chain = [Comp.Plain(resp.completion_text)]
+
+        # --- 开始 TTS 处理流程 ---
         
+        audio_path: Optional[str] = None
+        target_emotion = None
+        target_text = None
+        char_name = None
+
+        # 确定角色
         if session_id in self.w_active_sessions:
-            logger.info(f"[{session_id}] 捕获LLM文本，准备进行自动情感语音合成: {original_text}")
             char_name = self.session_w_settings.get(session_id, {}).get("character") or self.config.get("default_character")
+        else:
+            # 固定模式 或 群组模式
+            session_setting = self.session_emotions.get(session_id)
+            char_name = session_setting["character"] if session_setting else self.config.get("default_character")
+            # 固定模式下，如果没有注入情感，使用默认情感
+            if not injected_emotion:
+                target_emotion = session_setting["emotion"] if session_setting else self.config.get("default_emotion_name")
 
-            if not char_name or not self.emotion_manager.character_exists(char_name):
-                resp.result_chain.chain.append(Comp.Plain(f"\n(语音合成失败: 角色'{char_name}'未配置或无感情)"))
-                return
+        if not char_name or not self.emotion_manager.character_exists(char_name):
+            resp.result_chain.chain.append(Comp.Plain(f"\n(TTS失败: 角色'{char_name}'无效)"))
+            return
+
+        # 确定情感
+        if enable_llm_emotion and injected_emotion:
+            target_emotion = injected_emotion
+        
+        # 确定翻译文本
+        if enable_llm_translation and injected_translation:
+            target_text = injected_translation
+        else:
+            # 需要翻译
+            # 1. 检查是否使用 AstrBot Provider
+            use_astrbot_provider = settings.get("use_astrbot_provider", False)
+            provider_id = settings.get("astrbot_provider_id")
             
-            character_emotions = self.emotion_manager.emotions_data[char_name]
-            api_config = self.config.get("translation_api", {})
-            w_prompt_template = api_config.get("w_mode_prompt")
-            
-            if not w_prompt_template:
-                resp.result_chain.chain.append(Comp.Plain("\n(语音合成失败: 缺少提示词配置)"))
+            if use_astrbot_provider and provider_id:
+                try:
+                    provider = self.context.get_provider_by_id(provider_id)
+                    if provider:
+                        trans_prompt = settings.get("translation_prompt", "Translate to Japanese.")
+                        llm_resp = await provider.text_chat(
+                            prompt=original_text,
+                            system_prompt=trans_prompt
+                        )
+                        target_text = llm_resp.completion_text
+                    else:
+                        logger.error(f"未找到 Provider ID: {provider_id}")
+                except Exception as e:
+                    logger.error(f"AstrBot Provider 翻译失败: {e}")
+
+            # 2. 如果还没拿到文本，尝试旧版 API
+            if not target_text:
+                api_config = self.config.get("translation_api", {})
+                # 如果是在 w 模式下且没有注入情感，我们需要同时获取情感和翻译 (旧逻辑)
+                if session_id in self.w_active_sessions and not target_emotion:
+                     # 旧的自动情感识别逻辑
+                    character_emotions = self.emotion_manager.emotions_data[char_name]
+                    w_prompt_template = api_config.get("w_mode_prompt")
+                    if w_prompt_template:
+                        emotion_list_str = ", ".join(character_emotions.keys())
+                        augmented_prompt = w_prompt_template.format(emotion_list=emotion_list_str, text=original_text)
+                        japanese_text_with_emotion = await translate_text(augmented_prompt, self.http_client, api_config, w_prompt_template)
+                        
+                        if japanese_text_with_emotion:
+                            match = re.search(r'(.*)\[(.+?)\]\s*$', japanese_text_with_emotion.strip(), re.DOTALL)
+                            if match:
+                                target_text, target_emotion = match.group(1).strip(), match.group(2).strip()
+                
+                # 普通翻译逻辑
+                if not target_text:
+                    target_text = await translate_text(original_text, self.http_client, api_config)
+
+        if not target_text:
+            resp.result_chain.chain.append(Comp.Plain("\n(TTS失败: 翻译无结果)"))
+            return
+
+        # 最终合成
+        # 如果此时还没有 target_emotion (比如固定模式没注入，或者自动模式失败)，使用默认
+        if not target_emotion:
+             target_emotion = self.config.get("default_emotion_name")
+
+        emotion_data = self.emotion_manager.get_emotion_data(char_name, target_emotion)
+        if not emotion_data:
+             # 尝试回落到默认情感
+             default_emotion = self.config.get("default_emotion_name")
+             emotion_data = self.emotion_manager.get_emotion_data(char_name, default_emotion)
+             if not emotion_data:
+                resp.result_chain.chain.append(Comp.Plain(f"\n(TTS失败: 情感'{target_emotion}'无效)"))
                 return
 
-            emotion_list_str = ", ".join(character_emotions.keys())
-            augmented_prompt = w_prompt_template.format(emotion_list=emotion_list_str, text=original_text)
-            
-            japanese_text_with_emotion = await translate_text(augmented_prompt, self.http_client, api_config, w_prompt_template)
-            if not japanese_text_with_emotion:
-                resp.result_chain.chain.append(Comp.Plain("\n(翻译或情感识别失败)"))
-                return
-
-            match = re.search(r'(.*)\[(.+?)\]\s*$', japanese_text_with_emotion.strip(), re.DOTALL)
-            if not match:
-                resp.result_chain.chain.append(Comp.Plain("\n(语音合成失败: 无法解析情感)"))
-                return
-
-            japanese_text, emotion_name = match.group(1).strip(), match.group(2).strip()
-            emotion_data = self.emotion_manager.get_emotion_data(char_name, emotion_name)
-
-            if not emotion_data:
-                resp.result_chain.chain.append(Comp.Plain(f"\n(语音合成失败: 情感'{emotion_name}'无效)"))
-                return
-
-            audio_path = await self.tts_engine.synthesize(
-                character_name=char_name, ref_audio_path=emotion_data["ref_audio_path"],
-                ref_audio_text=emotion_data["ref_audio_text"], text=japanese_text, session_id_for_log=session_id
-            )
-
-        elif session_id in self.active_sessions:
-            logger.info(f"[{session_id}] 捕获LLM文本，准备语音合成: {original_text}")
-            api_config = self.config.get("translation_api", {})
-            japanese_text = await translate_text(original_text, self.http_client, api_config)
-            if not japanese_text:
-                resp.result_chain.chain.append(Comp.Plain("\n(翻译失败)"))
-                return
-            audio_path = await self._synthesize_speech_from_context(japanese_text, session_id)
+        audio_path = await self.tts_engine.synthesize(
+            character_name=char_name, ref_audio_path=emotion_data["ref_audio_path"],
+            ref_audio_text=emotion_data["ref_audio_text"], text=target_text, session_id_for_log=session_id
+        )
         
         if audio_path:
-            resp.result_chain.chain = [Comp.Record(file=audio_path)]
-            if self.config.get("send_text_with_audio", False):
-                resp.result_chain.chain.append(Comp.Plain(f"{original_text}"))
-        elif session_id in self.active_sessions or session_id in self.w_active_sessions:
-            resp.result_chain.chain.append(Comp.Plain("\n(语音合成失败)"))
+            # 将音频插入到消息链最前面
+            resp.result_chain.chain.insert(0, Comp.Record(file=audio_path))
+        else:
+            resp.result_chain.chain.append(Comp.Plain("\n(TTS合成失败)"))
 
     async def terminate(self):
         """插件卸载/停用时关闭http客户端"""

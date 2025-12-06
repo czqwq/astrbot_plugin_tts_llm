@@ -18,7 +18,7 @@
   },
   "translation_api": {
     "type": "object",
-    "description": "翻译API配置",
+    "description": "翻译API配置 (旧版独立API)",
     "items": {
       "base_url": {
         "type": "string",
@@ -55,6 +55,52 @@
       }
     }
   },
+  "llm_injection_settings": {
+    "description": "LLM 注入与高级翻译设置 (v1.3.0)",
+    "type": "object",
+    "items": {
+      "enable_llm_emotion": {
+        "description": "让主LLM直接生成情感标签",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，会自动向LLM注入提示词，要求其在回复中包含情感标签 [emotion=xxx]。"
+      },
+      "enable_llm_translation": {
+        "description": "让主LLM直接生成日语翻译",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，会自动向LLM注入提示词，要求其在回复中包含日语翻译 $xxx$。"
+      },
+      "llm_emotion_prompt": {
+        "description": "情感注入提示词模板",
+        "type": "text",
+        "default": "请在回复中包含情感标签。\n情感标签格式：[emotion=情感名]，例如 [emotion=开心]。\n可选的情感有：{emotions}。\n请将情感标签紧随回复主体之后或位于句首。",
+        "hint": "{emotions} 会被自动替换为当前角色可用的情感列表。"
+      },
+      "llm_translation_prompt": {
+        "description": "翻译注入提示词模板",
+        "type": "text",
+        "default": "请在回复中包含日语翻译。\n日语翻译格式：$日语内容$，例如 $こんにちは$。\n请将翻译内容紧随回复主体之后。"
+      },
+      "use_astrbot_provider": {
+        "description": "使用 AstrBot 框架内的模型进行翻译",
+        "type": "bool",
+        "default": false,
+        "hint": "如果未开启“主LLM生成翻译”，且开启此项，将使用下方选择的模型进行翻译，不再使用旧版独立API。"
+      },
+      "astrbot_provider_id": {
+        "description": "选择用于翻译的模型提供商",
+        "type": "string",
+        "_special": "select_provider",
+        "hint": "请确保所选模型可用。"
+      },
+      "translation_prompt": {
+        "description": "翻译专用提示词 (用于框架模型翻译)",
+        "type": "text",
+        "default": "你是一个专业的翻译助手。请将以下中文文本翻译成自然的日语口语。仅输出翻译后的文本，不要包含任何解释或额外内容。"
+      }
+    }
+  },
   "tts_servers": {
     "type": "list",
     "description": "TTS 服务器地址列表。可配置多个以实现故障转移。",
@@ -84,7 +130,7 @@
     "default": false,
     "hint": "开启后，插件会将长回复切分成短句，并行发送给多个TTS服务器合成，最后拼接成一条语音。可以显著提高响应速度。"
   },
-    "sentences_per_chunk": {
+  "sentences_per_chunk": {
     "type": "int",
     "description": "每个语音分段包含的句子数量",
     "default": 2,
