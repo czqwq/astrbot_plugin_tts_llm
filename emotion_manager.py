@@ -54,15 +54,19 @@ class EmotionManager:
         """检查角色是否存在"""
         return character_name in self.emotions_data
 
-    def register_emotion(self, character_name: str, emotion_name: str, ref_audio_path: str, ref_audio_text: str) -> bool:
+    def register_emotion(self, character_name: str, emotion_name: str, ref_audio_path: str, ref_audio_text: str, language: str = None) -> bool:
         """注册一个新的感情并保存"""
         if character_name not in self.emotions_data:
             self.emotions_data[character_name] = {}
 
-        self.emotions_data[character_name][emotion_name] = {
+        data = {
             "ref_audio_path": ref_audio_path,
             "ref_audio_text": ref_audio_text,
         }
+        if language:
+            data["language"] = language
+
+        self.emotions_data[character_name][emotion_name] = data
         return self._save_emotions_to_file()
 
     def delete_emotion(self, character_name: str, emotion_name: str) -> bool:

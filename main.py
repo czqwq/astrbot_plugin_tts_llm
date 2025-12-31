@@ -20,7 +20,7 @@ from .external_apis import translate_text
     "astrbot_plugin_tts_llm",
     "clown145",
     "一个通过LLM、翻译和TTS实现语音合成的插件",
-    "1.3.1",
+    "1.3.3",
     "https://github.com/clown145/astrbot_plugin_tts_llm",
 )
 class LlmTtsPlugin(Star):
@@ -94,14 +94,14 @@ class LlmTtsPlugin(Star):
 
     @filter.command("注册感情")
     async def register_emotion_command(
-        self, event: AstrMessageEvent, character_name: str, emotion_name: str, ref_audio_path: str, ref_audio_text: str,
+        self, event: AstrMessageEvent, character_name: str, emotion_name: str, ref_audio_path: str, ref_audio_text: str, language: str = None
     ):
         """注册一个新的感情并保存到文件"""
         if ".." in ref_audio_path or os.path.isabs(ref_audio_path):
             yield event.plain_result("❌ 错误：参考音频路径无效。它必须是一个相对路径，且不能包含 '..'。" )
             return
 
-        if self.emotion_manager.register_emotion(character_name, emotion_name, ref_audio_path, ref_audio_text):
+        if self.emotion_manager.register_emotion(character_name, emotion_name, ref_audio_path, ref_audio_text, language):
             yield event.plain_result(f"✅ 感情 '{emotion_name}' 已成功注册到角色 '{character_name}' 下。")
         else:
             self.emotion_manager.reload()  # 如果保存失败，从文件重新加载以恢复状态
@@ -159,6 +159,7 @@ class LlmTtsPlugin(Star):
             ref_audio_text=emotion_data["ref_audio_text"],
             text=text_to_synthesize,
             session_id_for_log=event.unified_msg_origin,
+            language=emotion_data.get("language"),
         )
 
         if audio_path:
@@ -274,6 +275,7 @@ class LlmTtsPlugin(Star):
             ref_audio_text=emotion_data["ref_audio_text"],
             text=text,
             session_id_for_log=session_id,
+            language=emotion_data.get("language"),
         )
 
     @filter.on_llm_request()
@@ -409,6 +411,9 @@ class LlmTtsPlugin(Star):
         # 确定翻译文本
         if enable_llm_translation and injected_translation:
             target_text = injected_translation
+        elif not self.config.get("enable_translation", True):
+            # 翻译功能已关闭，直接使用原文（适合中文模型）
+            target_text = original_text
         else:
             # 需要翻译
             # 1. 检查是否使用 AstrBot Provider
@@ -470,14 +475,21 @@ class LlmTtsPlugin(Star):
                 resp.result_chain.chain.append(Comp.Plain(f"\n(TTS失败: 情感'{target_emotion}'无效)"))
                 return
 
+        # 合成语音
         audio_path = await self.tts_engine.synthesize(
             character_name=char_name, ref_audio_path=emotion_data["ref_audio_path"],
-            ref_audio_text=emotion_data["ref_audio_text"], text=target_text, session_id_for_log=session_id
+            ref_audio_text=emotion_data["ref_audio_text"], text=target_text, session_id_for_log=session_id,
+            language=emotion_data.get("language"),
         )
         
         if audio_path:
-            # 将音频插入到消息链最前面
-            resp.result_chain.chain.insert(0, Comp.Record(file=audio_path))
+            # 根据配置决定是否发送原文
+            if self.config.get("send_text_with_audio", True):
+                # 语音和文字一起发送
+                resp.result_chain.chain.insert(0, Comp.Record(file=audio_path))
+            else:
+                # 只发送语音，清空原有的文字消息
+                resp.result_chain.chain = [Comp.Record(file=audio_path)]
         else:
             resp.result_chain.chain.append(Comp.Plain("\n(TTS合成失败)"))
 

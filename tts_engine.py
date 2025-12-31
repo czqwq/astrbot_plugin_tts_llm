@@ -120,19 +120,25 @@ class TTSEngine:
 
     async def _attempt_synthesis_on_server(
         self, server_url: str, character_name: str, ref_audio_path: str,
-        ref_audio_text: str, text: str, session_id_for_log: str,
+        ref_audio_text: str, text: str, session_id_for_log: str, language: str = None,
     ) -> Optional[str]:
         """使用单个指定的TTS服务器尝试合成语音，并返回保存好的文件路径。"""
         logger.info(f"[{session_id_for_log}] 尝试TTS服务器: {server_url}")
         try:
+            # Propagate the language parameter directly, fallback to config only if None provided
+            if not language:
+                language = self.config.get("tts_default_language", "jp")
+
             ref_payload = {
                 "character_name": character_name, "audio_path": ref_audio_path, "audio_text": ref_audio_text,
+                "language": language,
             }
+            tts_timeout = self.config.get("tts_timeout_seconds", 120)
             response = await self.http_client.post(f"{server_url}/set_reference_audio", json=ref_payload, timeout=60)
             response.raise_for_status()
 
             tts_payload = {"character_name": character_name, "text": text, "split_sentence": True}
-            async with self.http_client.stream("POST", f"{server_url}/tts", json=tts_payload, timeout=300) as response_tts:
+            async with self.http_client.stream("POST", f"{server_url}/tts", json=tts_payload, timeout=tts_timeout) as response_tts:
                 response_tts.raise_for_status()
                 output_path = self.temp_audio_dir / f"{uuid.uuid4()}.wav"
                 with wave.open(str(output_path), "wb") as wf:
@@ -149,6 +155,7 @@ class TTSEngine:
     async def _synthesis_worker(
         self, worker_id: int, task_queue: asyncio.Queue, results_list: list,
         character_name: str, ref_audio_path: str, ref_audio_text: str, session_id_for_log: str,
+        language: str = None,
     ):
         """单个TTS服务器的工作进程，从队列中获取任务并处理"""
         servers = self.config.get("tts_servers", [])
@@ -168,7 +175,7 @@ class TTSEngine:
                 log_id = f"{session_id_for_log}-chunk-{task_index+1}"
                 
                 audio_path = await self._attempt_synthesis_on_server(
-                    server_url, character_name, ref_audio_path, ref_audio_text, chunk_text, log_id
+                    server_url, character_name, ref_audio_path, ref_audio_text, chunk_text, log_id, language=language
                 )
                 if audio_path:
                     logger.info(f"[Worker-{worker_id}] 成功合成块 {task_index+1} 于服务器 {server_url}")
@@ -183,6 +190,7 @@ class TTSEngine:
 
     async def synthesize(
         self, character_name: str, ref_audio_path: str, ref_audio_text: str, text: str, session_id_for_log: str,
+        language: str = None,
     ) -> Optional[str]:
         """执行语音合成的核心入口点，支持并发处理"""
         servers = self.config.get("tts_servers", [])
@@ -200,17 +208,19 @@ class TTSEngine:
                     task_queue.put_nowait((i, chunk))
 
                 results_list = [None] * len(text_chunks)
+                num_workers = min(len(servers), len(text_chunks))
                 workers = [
                     asyncio.create_task(
                         self._synthesis_worker(
                             worker_id=i, task_queue=task_queue, results_list=results_list,
                             character_name=character_name, ref_audio_path=ref_audio_path,
                             ref_audio_text=ref_audio_text, session_id_for_log=session_id_for_log,
+                            language=language,
                         )
-                    ) for i in range(len(servers))
+                    ) for i in range(num_workers)
                 ]
 
-                logger.info(f"[{session_id_for_log}] 创建了 {len(workers)} 个worker来处理 {len(text_chunks)} 个语音块...")
+                logger.info(f"[{session_id_for_log}] 创建了 {num_workers} 个worker来处理 {len(text_chunks)} 个语音块...")
                 await task_queue.join()
                 for worker in workers:
                     worker.cancel()
@@ -244,7 +254,7 @@ class TTSEngine:
             audio_path = await self._attempt_synthesis_on_server(
                 server_url=server_url, character_name=character_name,
                 ref_audio_path=ref_audio_path, ref_audio_text=ref_audio_text,
-                text=text, session_id_for_log=session_id_for_log,
+                text=text, session_id_for_log=session_id_for_log, language=language,
             )
             if audio_path:
                 return audio_path
