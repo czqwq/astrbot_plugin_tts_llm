@@ -18,10 +18,10 @@ from .external_apis import translate_text
 
 @register(
     "astrbot_plugin_tts_llm",
-    "clown145",
+    "czqwq",
     "一个通过LLM、翻译和TTS实现语音合成的插件",
     "1.3.3",
-    "https://github.com/clown145/astrbot_plugin_tts_llm",
+    "https://github.com/czqwq/astrbot_plugin_tts_llm",
 )
 class LlmTtsPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -42,6 +42,14 @@ class LlmTtsPlugin(Star):
         
         self.http_client = httpx.AsyncClient(timeout=300.0)
         self.tts_engine = TTSEngine(self.config, self.http_client, plugin_data_dir)
+        
+        # 如果启用了本地GENIE，尝试初始化
+        if self.config.get("use_local_genie", False):
+            try:
+                import genie_tts as genie
+                logger.info("GENIE 本地模型已启用")
+            except ImportError:
+                logger.warning("GENIE 本地模型已启用但未安装 genie-tts 包，请运行 'pip install genie-tts'")
 
         if self.config.get("enable_space_keepalive"):
             self._keepalive_task = asyncio.create_task(self._keep_alive_loop())

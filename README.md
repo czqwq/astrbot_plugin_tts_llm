@@ -81,12 +81,15 @@ _✨ AstrBot LLM 回复语音合成插件 ✨_
 
 ## ⚠️ 重要前置：部署语音服务
 
-本插件**自身不进行语音合成**，它依赖一个后端的 **Genie TTS 服务**。您必须先拥有一个可访问的该服务，插件才能正常工作。
+本插件支持两种语音合成方式：
+
+1. **远程 TTS 服务**：依赖一个后端的 **Genie TTS 服务**。您需要部署一个Web服务。
+2. **本地 GENIE 模型**：直接在本地运行 GENIE 模型，无需额外的Web服务。
 
 > **Genie TTS** 是一个强大的语音合成项目，您需要将其部署为一个Web服务。
 > - **官方仓库**: [https://github.com/High-Logic/Genie](https://github.com/High-Logic/Genie)
 
-### 方案一：使用 Hugging Face 一键部署
+### 方案一：使用 Hugging Face 一键部署（远程服务）
 
 算力免费而且无需本地机器配置，但是合成速度比较慢。
 
@@ -99,15 +102,50 @@ _✨ AstrBot LLM 回复语音合成插件 ✨_
     -   若要使用您自己的模型，请将您训练和转换好的模型上传到您自己的 Hugging Face 模型仓库，然后在 Space 的 `app.py` 文件中修改 `REPO_ID` 和 `CHARACTERS` 字典。
     -   **【关键步骤】** 在您的空间中，**您必须创建一个名为 `reference_audio` 的文件夹**，并将所有用于注册情感的参考音频文件（如 `.wav`, `.ogg`）放入其中。
     -   **注意：** Genie 服务目前有加载3个模型的上限，请确保 `CHARACTERS` 字典中启用的角色不超过3个。
-3.  **开启自动保活（可选）**：Hugging Face Space 超过 24 小时无人访问会休眠。插件新增了“自动保活空间”的开关，开启后会定时访问空间主页防止休眠。配置项：
-    -   **启用**：在插件配置中打开“是否自动定期访问 Hugging Face Space 以防止休眠”。
-    -   **保活地址**：默认使用 TTS 服务器列表的第一个地址，若您想单独设置，请填写“保活请求的目标地址”。
-    -   **间隔**：可通过“两次保活之间的间隔分钟数”调整访问频率，建议 15-30 分钟。
+3.  **开启自动保活（可选）**：Hugging Face Space 超过 24 小时无人访问会休眠。插件新增了"自动保活空间"的开关，开启后会定时访问空间主页防止休眠。配置项：
+    -   **启用**：在插件配置中打开"是否自动定期访问 Hugging Face Space 以防止休眠"。
+    -   **保活地址**：默认使用 TTS 服务器列表的第一个地址，若您想单独设置，请填写"保活请求的目标地址"。
+    -   **间隔**：可通过"两次保活之间的间隔分钟数"调整访问频率，建议 15-30 分钟。
 
-### 方案二：本地或 Windows 部署
+### 方案二：本地或 Windows 部署（远程服务）
 
 - 如果您想在本地运行，请参照 Genie 官方仓库的文档进行部署。
 - 作者还提供了 **Windows 一键整合包**，极大简化了部署流程，详情请访问其 GitHub。
+
+### 方案三：本地 GENIE 模型（推荐）
+
+直接在本地运行 GENIE 模型，无需额外的Web服务，性能更佳。
+
+1.  **安装 GENIE**：
+    ```bash
+    pip install genie-tts
+    ```
+    
+2.  **下载预训练模型**：
+    - 首次运行时，GENIE 会自动下载必要的资源文件（约391MB）。
+    - 或者，您可以手动从 HuggingFace 下载资源文件到本地目录，然后在插件配置中设置 "GENIE 数据目录"。
+
+3.  **使用预定义角色**：
+    GENIE 内置了几个预定义角色，可以直接使用：
+    - Mika (聖園ミカ) — Blue Archive (Japanese)
+    - ThirtySeven (37) — Reverse: 1999 (English)
+    - Feibi (菲比) — Wuthering Waves (Chinese)
+
+4.  **使用自定义角色模型**：
+    - 将您转换好的 ONNX 模型文件放在指定目录中。
+    - 在插件配置中设置 "GENIE 角色模型目录" 为包含角色模型的父目录。
+    - 每个角色应有独立的子目录，例如：
+      ```
+      character_models/
+      ├── kisaki/
+      │   ├── config.json
+      │   ├── gpt.onnx
+      │   └── vits.onnx
+      └── aoi/
+          ├── config.json
+          ├── gpt.onnx
+          └── vits.onnx
+      ```
 
 **部署完成后，请记下您的服务 URL (例如 `https://your-name-your-space.hf.space`)，后续配置插件时需要用到。**
 
@@ -128,6 +166,16 @@ _✨ AstrBot LLM 回复语音合成插件 ✨_
   # 重启 AstrBot
   ```
 
+### GENIE 本地模型依赖安装（可选）
+
+如果您计划使用本地 GENIE 模型，请额外安装以下依赖：
+
+```bash
+pip install genie-tts
+```
+
+注意：GENIE 需要 Python >= 3.9。
+
 ---
 
 ## ⚙️ 插件配置
@@ -137,7 +185,10 @@ _✨ AstrBot LLM 回复语音合成插件 ✨_
 ### 基础配置
 | 配置项 | 说明 | 示例 |
 | :--- | :--- | :--- |
-| **TTS 服务器地址列表** | **【核心】** 填入您部署好的Genie TTS服务URL。可点击"+"添加多个。 | `https://your-name.hf.space` |
+| **使用本地 GENIE 模型** | 启用本地 GENIE 模型进行语音合成，而不是使用远程 API。 | `true` / `false` |
+| **GENIE 数据目录** | GENIE 模型和资源文件的存储目录路径（可选）。 | `C:\\path\\to\\genie\\data` |
+| **GENIE 角色模型目录** | 自定义角色 ONNX 模型文件的目录路径（可选）。 | `C:\\path\\to\\character\\models` |
+| **TTS 服务器地址列表** | **【核心】** 填入您部署好的Genie TTS服务URL。**仅在未使用本地 GENIE 时生效**。可点击"+"添加多个。 | `https://your-name.hf.space` |
 | **是否附带原文** | 发送语音时，是否同时发送 LLM 生成的原始文本。 | `true` / `false` |
 | **默认角色名** | 自动语音模式下使用的默认角色。**必须是已注册过的。** | `kisaki` |
 | **默认情感名** | **固定情感模式**下使用的默认情感。 | `开心` |
@@ -227,3 +278,19 @@ _✨ AstrBot LLM 回复语音合成插件 ✨_
 ## 🤝 致谢
 
 - 本插件的语音合成功能由 [**Genie TTS**](https://github.com/High-Logic/Genie) 库提供核心支持，由衷感谢原作者的杰出工作。
+
+## 🛠️ GENIE 模型设置工具
+
+插件包含一个GENIE模型设置工具，可以帮助您设置和测试自定义模型：
+
+```bash
+python genie_setup.py
+```
+
+该工具提供以下功能：
+- 设置GENIE数据目录
+- 加载预定义角色
+- 加载自定义角色模型
+- 设置参考音频
+- 测试TTS功能
+- 转换原始GPT-SoVITS模型为GENIE格式

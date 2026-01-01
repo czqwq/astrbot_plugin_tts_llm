@@ -1,7 +1,25 @@
 {
+  "use_local_genie": {
+    "title": "🤖 使用本地 GENIE 模型",
+    "description": "启用本地 GENIE 模型进行语音合成，而不是使用远程 API。",
+    "type": "bool",
+    "default": false
+  },
+  "genie_data_dir": {
+    "title": "📂 GENIE 数据目录",
+    "description": "GENIE 模型和资源文件的存储目录路径。",
+    "type": "string",
+    "default": ""
+  },
+  "genie_character_models_dir": {
+    "title": "🎭 GENIE 角色模型目录",
+    "description": "自定义角色 ONNX 模型文件的目录路径。",
+    "type": "string",
+    "default": ""
+  },
   "tts_servers": {
     "title": "🔊 TTS 服务器列表",
-    "description": "TTS 服务器地址列表（按顺序尝试）。支持多个，用于负载均衡或故障转移。",
+    "description": "TTS 服务器地址列表（按顺序尝试）。支持多个，用于负载均衡或故障转移。仅在未使用本地 GENIE 时生效。",
     "type": "list",
     "items": {
       "type": "string"

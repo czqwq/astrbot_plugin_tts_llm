@@ -10,6 +10,14 @@ from typing import Optional, List, Dict
 import httpx
 from astrbot.api import logger, AstrBotConfig
 
+# 尝试导入 genie_tts
+try:
+    import genie_tts as genie
+    GENIE_AVAILABLE = True
+except ImportError:
+    GENIE_AVAILABLE = False
+    genie = None
+
 # --- 音频参数 (必须与Genie TTS服务输出匹配) ---
 BYTES_PER_SAMPLE = 2
 CHANNELS = 1
@@ -24,6 +32,23 @@ class TTSEngine:
         self.http_client = http_client
         self.plugin_data_dir = plugin_data_dir
         self.tts_server_index = 0
+        
+        # GENIE 相关初始化
+        self.use_local_genie = self.config.get("use_local_genie", False)
+        if self.use_local_genie and GENIE_AVAILABLE:
+            # 设置 GENIE 数据目录（如果配置了的话）
+            genie_data_dir = self.config.get("genie_data_dir", "")
+            if genie_data_dir:
+                import os
+                os.environ["GENIE_DATA_DIR"] = genie_data_dir
+            
+            # 预加载字符模型目录
+            self.genie_character_models_dir = self.config.get("genie_character_models_dir", "")
+            
+            logger.info("GENIE 本地模型支持已启用")
+        elif self.use_local_genie:
+            logger.warning("GENIE 本地模型已启用但未安装 genie_tts 包，请运行 'pip install genie-tts'")
+            self.use_local_genie = False
         
         # 设置临时音频目录
         self.temp_audio_dir = self.plugin_data_dir / "temp_audio"
@@ -151,6 +176,76 @@ class TTSEngine:
         except Exception as e:
             logger.warning(f"[{session_id_for_log}] TTS服务器 {server_url} 交互失败: {e}")
             return None
+
+    async def _attempt_synthesis_with_genie(
+        self, character_name: str, ref_audio_path: str,
+        ref_audio_text: str, text: str, session_id_for_log: str, language: str = None,
+    ) -> Optional[str]:
+        """使用本地GENIE模型尝试合成语音，并返回保存好的文件路径。"""
+        logger.info(f"[{session_id_for_log}] 尝试使用本地GENIE模型: {character_name}")
+        
+        if not GENIE_AVAILABLE:
+            logger.error(f"[{session_id_for_log}] GENIE 未安装")
+            return None
+        
+        try:
+            # 确定语言
+            if not language:
+                language = self.config.get("tts_default_language", "jp")
+            
+            # 检查是否是预定义角色
+            predefined_characters = ["mika", "37", "feibi"]  # GENIE内置角色
+            if character_name.lower() in predefined_characters:
+                # 对于预定义角色，直接加载
+                genie.load_predefined_character(character_name.lower())
+            else:
+                # 对于自定义角色，尝试从指定目录加载模型
+                if self.genie_character_models_dir:
+                    import os
+                    model_path = os.path.join(self.genie_character_models_dir, character_name)
+                    if os.path.exists(model_path):
+                        genie.load_character(
+                            character_name=character_name,
+                            onnx_model_dir=model_path,
+                            language=language
+                        )
+                    else:
+                        logger.warning(f"[{session_id_for_log}] 未找到角色 {character_name} 的模型目录: {model_path}")
+                        # 尝试加载预定义角色作为后备
+                        genie.load_predefined_character(character_name.lower())
+                else:
+                    logger.info(f"[{session_id_for_log}] 未指定模型目录，尝试加载预定义角色: {character_name}")
+                    try:
+                        genie.load_predefined_character(character_name.lower())
+                    except Exception:
+                        logger.warning(f"[{session_id_for_log}] 无法加载预定义角色 {character_name}，尝试其他方法")
+                        return None
+            
+            # 设置参考音频
+            genie.set_reference_audio(
+                character_name=character_name,
+                audio_path=ref_audio_path,
+                audio_text=ref_audio_text
+            )
+            
+            # 生成输出路径
+            output_path = self.temp_audio_dir / f"{uuid.uuid4()}_genie.wav"
+            
+            # 执行TTS
+            genie.tts(
+                character_name=character_name,
+                text=text,
+                save_path=str(output_path)
+            )
+            
+            logger.info(f"[{session_id_for_log}] GENIE TTS 合成成功: {output_path}")
+            return str(output_path)
+            
+        except Exception as e:
+            logger.warning(f"[{session_id_for_log}] GENIE 本地模型合成失败: {e}")
+            import traceback
+            logger.debug(f"[{session_id_for_log}] GENIE 错误详情: {traceback.format_exc()}")
+            return None
         
     async def _synthesis_worker(
         self, worker_id: int, task_queue: asyncio.Queue, results_list: list,
@@ -158,44 +253,88 @@ class TTSEngine:
         language: str = None,
     ):
         """单个TTS服务器的工作进程，从队列中获取任务并处理"""
-        servers = self.config.get("tts_servers", [])
-        num_servers = len(servers)
-        
-        while not task_queue.empty():
-            try:
-                task_index, chunk_text = await task_queue.get()
-            except asyncio.CancelledError:
-                break
-            
-            start_server_idx = worker_id % num_servers
-            audio_path = None
-            for i in range(num_servers):
-                server_idx = (start_server_idx + i) % num_servers
-                server_url = servers[server_idx].strip("/")
+        # 如果使用本地GENIE，则使用GENIE进行所有切分块的合成
+        if self.use_local_genie and GENIE_AVAILABLE:
+            while not task_queue.empty():
+                try:
+                    task_index, chunk_text = await task_queue.get()
+                except asyncio.CancelledError:
+                    break
+                
                 log_id = f"{session_id_for_log}-chunk-{task_index+1}"
                 
-                audio_path = await self._attempt_synthesis_on_server(
-                    server_url, character_name, ref_audio_path, ref_audio_text, chunk_text, log_id, language=language
+                audio_path = await self._attempt_synthesis_with_genie(
+                    character_name=character_name, ref_audio_path=ref_audio_path,
+                    ref_audio_text=ref_audio_text, text=chunk_text, session_id_for_log=log_id,
+                    language=language
                 )
                 if audio_path:
-                    logger.info(f"[Worker-{worker_id}] 成功合成块 {task_index+1} 于服务器 {server_url}")
+                    logger.info(f"[Worker-{worker_id}] 成功合成块 {task_index+1} 通过本地GENIE")
                     results_list[task_index] = audio_path
-                    break
-            
-            if not audio_path:
-                logger.error(f"[Worker-{worker_id}] 块 {task_index+1} 尝试所有服务器后仍然失败。")
-                results_list[task_index] = None
+                else:
+                    logger.error(f"[Worker-{worker_id}] 块 {task_index+1} 通过本地GENIE合成失败。")
+                    results_list[task_index] = None
 
-            task_queue.task_done()
+                task_queue.task_done()
+        else:
+            # 使用远程服务器
+            servers = self.config.get("tts_servers", [])
+            num_servers = len(servers)
+            
+            while not task_queue.empty():
+                try:
+                    task_index, chunk_text = await task_queue.get()
+                except asyncio.CancelledError:
+                    break
+                
+                start_server_idx = worker_id % num_servers
+                audio_path = None
+                for i in range(num_servers):
+                    server_idx = (start_server_idx + i) % num_servers
+                    server_url = servers[server_idx].strip("/")
+                    log_id = f"{session_id_for_log}-chunk-{task_index+1}"
+                    
+                    audio_path = await self._attempt_synthesis_on_server(
+                        server_url, character_name, ref_audio_path, ref_audio_text, chunk_text, log_id, language=language
+                    )
+                    if audio_path:
+                        logger.info(f"[Worker-{worker_id}] 成功合成块 {task_index+1} 于服务器 {server_url}")
+                        results_list[task_index] = audio_path
+                        break
+                
+                if not audio_path:
+                    logger.error(f"[Worker-{worker_id}] 块 {task_index+1} 尝试所有服务器后仍然失败。")
+                    results_list[task_index] = None
+
+                task_queue.task_done()
 
     async def synthesize(
         self, character_name: str, ref_audio_path: str, ref_audio_text: str, text: str, session_id_for_log: str,
         language: str = None,
     ) -> Optional[str]:
         """执行语音合成的核心入口点，支持并发处理"""
+        
+        # 首先检查是否使用本地GENIE模型
+        if self.use_local_genie and GENIE_AVAILABLE:
+            logger.info(f"[{session_id_for_log}] 使用本地GENIE模型进行合成。")
+            audio_path = await self._attempt_synthesis_with_genie(
+                character_name=character_name,
+                ref_audio_path=ref_audio_path,
+                ref_audio_text=ref_audio_text,
+                text=text,
+                session_id_for_log=session_id_for_log,
+                language=language,
+            )
+            if audio_path:
+                return audio_path
+            
+            # 如果本地GENIE失败，回落到远程服务器
+            logger.warning(f"[{session_id_for_log}] 本地GENIE合成失败，尝试远程服务器。")
+        
+        # 使用远程服务器
         servers = self.config.get("tts_servers", [])
         if not servers:
-            logger.error(f"[{session_id_for_log}] 未配置TTS服务器。")
+            logger.error(f"[{session_id_for_log}] 未配置TTS服务器，且本地GENIE不可用。")
             return None
 
         if self.config.get("enable_sentence_splitting", False):
